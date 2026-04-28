@@ -2,124 +2,104 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const crypto = require('crypto');
+
 const whatsapp = require('./whatsapp');
 const instagram = require('./instagram');
+const manychat = require('./manychat');
+const schedule = require('./schedule');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
+app.use(bodyParser.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
 
-app.use(bodyParser.json({
-  verify: (req, res, buf) => { req.rawBody = buf; }
-}));
-
-// Verificar firma de Meta
-function verifyMetaSignature(req) {
-  const signature = req.headers['x-hub-signature-256'];
-  if (!signature || !process.env.META_APP_SECRET) return true; // Skip en dev
-  const expected = 'sha256=' + crypto
-    .createHmac('sha256', process.env.META_APP_SECRET)
-    .update(req.rawBody)
-    .digest('hex');
-  return signature === expected;
+function verifyMeta(req) {
+  const sig = req.headers['x-hub-signature-256'];
+  if (!sig || !process.env.META_APP_SECRET) return true;
+  const expected = 'sha256=' + crypto.createHmac('sha256', process.env.META_APP_SECRET).update(req.rawBody).digest('hex');
+  return sig === expected;
 }
 
-// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+// Health check
+app.get('/', (req, res) => res.json({
+  status: 'online',
+  service: 'Agente IA Grow - Taller AR',
+  agentActive: schedule.isAgentActive(),
+  timestamp: new Date().toLocaleString('es-CL', { timeZone: 'America/Santiago' })
+}));
 
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'Agente IA Taller AR', timestamp: new Date().toISOString() });
-});
-
-// ─── WHATSAPP WEBHOOK ─────────────────────────────────────────────────────────
-
+// WhatsApp
 app.get('/webhook/whatsapp', (req, res) => {
-  const challenge = whatsapp.verifyWebhook(req.query);
-  if (challenge) {
-    console.log('WhatsApp webhook verificado OK');
-    return res.status(200).send(challenge);
-  }
+  const ch = whatsapp.verifyWebhook(req.query);
+  if (ch) return res.status(200).send(ch);
   res.sendStatus(403);
 });
-
 app.post('/webhook/whatsapp', async (req, res) => {
-  if (!verifyMetaSignature(req)) return res.sendStatus(401);
-  res.sendStatus(200); // Responder inmediatamente a Meta
+  if (!verifyMeta(req)) return res.sendStatus(401);
+  res.sendStatus(200);
   await whatsapp.processWebhook(req.body);
 });
 
-// ─── INSTAGRAM WEBHOOK ────────────────────────────────────────────────────────
-
+// Instagram
 app.get('/webhook/instagram', (req, res) => {
-  const challenge = instagram.verifyWebhook(req.query);
-  if (challenge) {
-    console.log('Instagram webhook verificado OK');
-    return res.status(200).send(challenge);
-  }
+  const ch = instagram.verifyWebhook(req.query);
+  if (ch) return res.status(200).send(ch);
   res.sendStatus(403);
 });
-
 app.post('/webhook/instagram', async (req, res) => {
-  if (!verifyMetaSignature(req)) return res.sendStatus(401);
+  if (!verifyMeta(req)) return res.sendStatus(401);
   res.sendStatus(200);
   await instagram.processWebhook(req.body);
 });
 
-// ─── SHOPIFY WEBHOOK (carrito abandonado) ─────────────────────────────────────
-
-app.post('/webhook/shopify/abandoned-cart', async (req, res) => {
-  res.sendStatus(200);
-  const checkout = req.body;
-  // Solo procesar si tiene teléfono (para WhatsApp)
-  const phone = checkout.phone || checkout.billing_address?.phone;
-  if (!phone) return;
-
-  const agent = require('./agent');
-  const wa = require('./whatsapp');
-
-  const productNames = (checkout.line_items || []).map(i => i.title).join(', ');
-  const total = checkout.total_price ? '$' + parseInt(checkout.total_price).toLocaleString('es-CL') : '';
-
-  const result = await agent.processMessage({
-    userId: phone,
-    message: `[CARRITO ABANDONADO] La clienta dejó en su carrito: ${productNames}. Total: ${total}. Link de recuperación: ${checkout.abandoned_checkout_url}`,
-    channel: 'whatsapp',
-    userData: { name: checkout.billing_address?.first_name || 'Clienta' },
-  });
-
-  // Esperar 2 horas antes de enviar (en producción usar job queue)
-  setTimeout(() => {
-    wa.sendMessage(phone, result.message);
-  }, 2 * 60 * 60 * 1000);
+// ManyChat webhook (para integración directa)
+app.post('/webhook/manychat', async (req, res) => {
+  try {
+    const response = await manychat.processManyChatWebhook(req.body);
+    res.json(response);
+  } catch (e) {
+    res.json({ version: 'v2', content: { messages: [{ type: 'text', text: 'Un momento, ya te ayudo.' }] } });
+  }
 });
 
-// ─── API INTERNA (para testing) ───────────────────────────────────────────────
+// Shopify carrito abandonado
+app.post('/webhook/shopify/abandoned', async (req, res) => {
+  res.sendStatus(200);
+  const checkout = req.body;
+  const phone = checkout.phone;
+  if (!phone || !schedule.isAgentActive()) return;
 
-app.post('/api/test-agent', async (req, res) => {
-  const { message, userId = 'test-user', channel = 'whatsapp' } = req.body;
-  if (!message) return res.status(400).json({ error: 'message required' });
+  const items = (checkout.line_items || []).map(i => i.title).join(', ');
+  const wa = require('./whatsapp');
+  setTimeout(async () => {
+    await wa.sendMessage(phone, `Hola! Vi que dejaste ${items} en tu carrito 🛍️ ¿Te ayudo a completar tu compra? Puedo reservártelo ahora mismo.`);
+  }, 2 * 60 * 60 * 1000); // 2 horas
+});
 
+// Test del agente
+app.post('/api/test', async (req, res) => {
+  const { message, userId = 'test', channel = 'instagram', imageUrl } = req.body;
+  if (!message && !imageUrl) return res.status(400).json({ error: 'message required' });
   const agent = require('./agent');
-  const result = await agent.processMessage({ userId, message, channel });
+  const result = await agent.processMessage({ userId, message: message || '', channel, imageUrl });
   res.json(result);
 });
 
-app.get('/api/products', async (req, res) => {
-  const shopify = require('./shopify');
-  const products = await shopify.getProducts({ limit: 10 });
-  res.json({ count: products.length, products: products.map(shopify.formatProductForAgent) });
+// Estado del horario
+app.get('/api/schedule', (req, res) => {
+  res.json({
+    active: schedule.isAgentActive(),
+    time: new Date().toLocaleString('es-CL', { timeZone: 'America/Santiago' }),
+  });
 });
-
-// ─── START ────────────────────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`
-  ╔═══════════════════════════════════════╗
-  ║   🌸 Agente IA Taller AR - ONLINE 🌸  ║
-  ║   Puerto: ${PORT}                        ║
-  ║   WhatsApp: /webhook/whatsapp         ║
-  ║   Instagram: /webhook/instagram       ║
-  ╚═══════════════════════════════════════╝
+  ╔══════════════════════════════════════════╗
+  ║  🌸 Agente IA Grow - Taller AR - LIVE 🌸 ║
+  ║  Puerto: ${PORT}                             ║
+  ║  Agente activo: ${schedule.isAgentActive() ? 'SÍ ✅' : 'NO (equipo humano)'}          ║
+  ╚══════════════════════════════════════════╝
   `);
 });
 

@@ -1,65 +1,65 @@
 const axios = require('axios');
 const agent = require('./agent');
 const wa = require('./whatsapp');
+const schedule = require('./schedule');
 
-const IG_API_URL = 'https://graph.facebook.com/v18.0';
-
-// ─── ENVIAR MENSAJE DM ────────────────────────────────────────────────────────
+const IG_URL = 'https://graph.facebook.com/v18.0';
 
 async function sendDM(recipientId, text) {
   try {
     await axios.post(
-      `${IG_API_URL}/${process.env.INSTAGRAM_PAGE_ID}/messages`,
-      {
-        recipient: { id: recipientId },
-        message: { text },
-        messaging_type: 'RESPONSE',
-      },
+      `${IG_URL}/${process.env.INSTAGRAM_PAGE_ID}/messages`,
+      { recipient: { id: recipientId }, message: { text }, messaging_type: 'RESPONSE' },
       { headers: { Authorization: `Bearer ${process.env.WHATSAPP_ACCESS_TOKEN}` } }
     );
-  } catch (e) {
-    console.error('Error enviando IG DM:', e.response?.data || e.message);
-  }
+  } catch (e) { console.error('IG DM error:', e.response?.data || e.message); }
 }
-
-// ─── RESPONDER COMENTARIO ─────────────────────────────────────────────────────
 
 async function replyToComment(commentId, message) {
   try {
-    await axios.post(
-      `${IG_API_URL}/${commentId}/replies`,
+    await axios.post(`${IG_URL}/${commentId}/replies`,
       { message },
       { params: { access_token: process.env.WHATSAPP_ACCESS_TOKEN } }
     );
-  } catch (e) {
-    console.error('Error respondiendo comentario IG:', e.message);
-  }
+  } catch (e) {}
 }
-
-// ─── PROCESAR WEBHOOK ─────────────────────────────────────────────────────────
 
 async function processWebhook(body) {
   try {
     const entry = body.entry?.[0];
-    const messaging = entry?.messaging;
-    const changes = entry?.changes;
 
-    // DM de Instagram
-    if (messaging && messaging.length > 0) {
-      for (const event of messaging) {
+    // --- DMs ---
+    if (entry?.messaging?.length > 0) {
+      for (const event of entry.messaging) {
         if (!event.message || event.message.is_echo) continue;
 
         const senderId = event.sender.id;
         const text = event.message.text || '';
-        if (!text) continue;
+        let imageUrl = null;
 
-        console.log(`IG DM de ${senderId}: ${text}`);
+        // Detectar imagen en DM
+        if (event.message.attachments) {
+          const imgAttachment = event.message.attachments.find(a => a.type === 'image');
+          if (imgAttachment) imageUrl = imgAttachment.payload?.url;
+        }
+
+        // Detectar respuesta a story
+        if (event.message.reply_to?.story) {
+          imageUrl = event.message.reply_to.story.url;
+        }
+
+        // Verificar horario
+        if (!schedule.isAgentActive()) {
+          await sendDM(senderId, schedule.getOfflineMessage());
+          return;
+        }
 
         const result = await agent.processMessage({
           userId: senderId,
-          message: text,
+          message: text || (imageUrl ? 'El cliente envió una imagen' : ''),
           channel: 'instagram',
           userData: {},
+          imageUrl,
         });
 
         await sendDM(senderId, result.message);
@@ -67,21 +67,18 @@ async function processWebhook(body) {
         if (result.needsHuman) {
           await wa.sendTicketToHuman({
             clientPhone: senderId,
-            clientName: 'Usuario de Instagram',
+            clientName: 'Usuario Instagram',
             reason: result.escalateReason,
-            summary: result.escalateSummary,
             channel: 'Instagram DM',
           });
-          await sendDM(senderId,
-            'Te estoy conectando con una asesora. Te responderemos muy pronto. ¡Gracias! 🌸'
-          );
+          await sendDM(senderId, 'Te conecto con una asesora ahora. ¡Te responden pronto! 🌸');
         }
       }
     }
 
-    // Comentarios en posts
-    if (changes && changes.length > 0) {
-      for (const change of changes) {
+    // --- Comentarios ---
+    if (entry?.changes?.length > 0) {
+      for (const change of entry.changes) {
         if (change.field !== 'comments') continue;
 
         const commentData = change.value;
@@ -89,20 +86,16 @@ async function processWebhook(body) {
         const commentId = commentData.id;
         const commenterId = commentData.from?.id;
 
-        // Solo responder comentarios con keywords de compra
-        const buyKeywords = ['precio', 'costo', 'talla', 'disponible', 'cuánto', 'cuanto', 'quiero', 'comprar', 'stock', 'info'];
+        const buyKeywords = ['precio', 'costo', 'talla', 'disponible', 'cuánto', 'cuanto', 'quiero', 'comprar', 'stock', 'info', 'tienen', 'hay', 'venden', 'dónde'];
         const hasBuyIntent = buyKeywords.some(kw => commentText.toLowerCase().includes(kw));
 
         if (hasBuyIntent && commentId) {
-          await replyToComment(commentId,
-            'Hola! Te escribimos por DM para ayudarte con más detalles 🌸✨'
-          );
+          await replyToComment(commentId, '¡Hola! Te escribimos por DM para ayudarte 🌸✨');
 
-          // Iniciar conversación DM automáticamente si tenemos el ID
-          if (commenterId) {
+          if (commenterId && schedule.isAgentActive()) {
             const result = await agent.processMessage({
               userId: commenterId,
-              message: `Vi tu comentario: "${commentText}". ¿En qué te puedo ayudar?`,
+              message: `Vi tu comentario en el post: "${commentText}". ¿Te ayudo a encontrar lo que buscas?`,
               channel: 'instagram',
               userData: {},
             });
@@ -111,18 +104,12 @@ async function processWebhook(body) {
         }
       }
     }
-  } catch (e) {
-    console.error('Error procesando webhook IG:', e.message);
-  }
+  } catch (e) { console.error('IG webhook error:', e.message); }
 }
 
 function verifyWebhook(query) {
-  const mode = query['hub.mode'];
-  const token = query['hub.verify_token'];
-  const challenge = query['hub.challenge'];
-
-  if (mode === 'subscribe' && token === process.env.META_VERIFY_TOKEN) {
-    return challenge;
+  if (query['hub.mode'] === 'subscribe' && query['hub.verify_token'] === process.env.META_VERIFY_TOKEN) {
+    return query['hub.challenge'];
   }
   return null;
 }

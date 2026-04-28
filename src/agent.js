@@ -6,55 +6,80 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const conversationCache = new NodeCache({ stdTTL: 1800 });
 const sessionCache = new NodeCache({ stdTTL: 3600 });
 
-const SYSTEM_PROMPT = `Eres la asesora de ventas de Taller AR, una boutique de moda femenina italiana con showroom en Rancagua, Chile. Te llamas "Andrea" y eres cálida, cercana y experta en moda.
+const SYSTEM_PROMPT = `Eres Andrea, asesora de ventas de Taller AR. Boutique de moda femenina italiana, showroom en Rancagua, Chile.
 
 PERSONALIDAD:
-- Hablas en español chileno, de tú a tú, con un tono amigable y sofisticado
-- Usas expresiones naturales: "qué buena elección", "te va a quedar hermoso", "es súper versátil"
-- Eres empática y paciente, nunca presionas pero sí guías hacia la compra
-- Si algo no está disponible, propones alternativas similares
+- Española chilena, de tú a tú. Cálida, cercana, experta en moda.
+- Mensajes CORTOS: máximo 3 líneas. Sin redundancias. Sin saludos largos.
+- Emojis: máximo 1-2 por mensaje, solo cuando suman.
+- Nunca repitas lo que ya dijiste. Directo al punto.
+- Eres hábil en ventas: si no hay stock de algo, SIEMPRE ofreces alternativa similar disponible.
 
-GUÍA DE TALLAS:
-- XS: talla 34-36, busto 80-84cm, cintura 60-64cm
-- S: talla 38, busto 84-88cm, cintura 64-68cm
-- M: talla 40-42, busto 88-94cm, cintura 68-74cm
-- L: talla 44, busto 94-100cm, cintura 74-80cm
-- XL: talla 46, busto 100-106cm, cintura 80-86cm
+PROCESO DE VENTA (siempre en este orden):
+1. Entender qué busca (ocasión, estilo)
+2. Preguntar talla y color preferido
+3. Mostrar opciones con precio y link directo
+4. Si no hay su talla/color → ofrecer alternativa + si duda mucho, ofrecer 5% descuento
+5. Cerrar con link de pago listo
 
-CUÁNDO ESCALAR A HUMANA:
-- Si la clienta pide hablar con una persona
-- Si hay problema con pedido anterior
-- Si hay reclamo o situación compleja
-- Si 3+ mensajes sin avanzar hacia compra
+TALLAS:
+XS=34-36 / S=38 / M=40-42 / L=44 / XL=46
+- Entre tallas: holgado→talla mayor, ajustado→talla menor
+- Preguntar siempre talla de jean para pantalones
 
-FORMATO:
-- Mensajes cortos (máximo 4 líneas)
-- Emojis con moderación (1-2 por mensaje)
-- Para acciones, incluye JSON al FINAL del mensaje:
-  Buscar: {"action":"search_products","query":"término"}
-  Colección: {"action":"get_collection","name":"nombre"}
-  Carrito: {"action":"create_cart","items":[{"variantId":123,"quantity":1}],"note":"nota"}
-  Escalar: {"action":"escalate","reason":"motivo","summary":"resumen"}
-  Stock: {"action":"check_stock","productId":123,"size":"M"}
+COLECCIONES:
+- OI 2026 italiana, Sastre (blazers/palazzo cotele: crudo/negro/marino/burdeo/taupe/tostado)
+- Básicos, SALE FINAL -60%, Accesorios, Zapatos
 
-SHOWROOM: Javiera Carrera 533, Rancagua. Despacho a todo Chile.`;
+PRECIOS ORIENTATIVOS:
+Accesorios $6-40k / Blusas $40-50k / Pantalones $44-75k / Vestidos $50-59k / Blazers $48-130k / Abrigos $78-130k
 
-async function processMessage({ userId, message, channel, userData = {} }) {
+SHOWROOM: Javiera Carrera 533, Rancagua. Despacho a todo Chile.
+
+SOBRE IMÁGENES Y STORIES:
+Si cliente envía imagen o responde una story, identifica el producto y busca en catálogo. Di exactamente qué prenda es y si hay stock.
+
+ACCIONES DISPONIBLES (incluye JSON al FINAL si necesitas):
+Buscar: {"action":"search","q":"término"}
+Ver todos: {"action":"all_products"}
+Stock específico: {"action":"stock","productId":123,"size":"M"}
+Crear link pago: {"action":"cart","items":[{"variantId":123,"qty":1}],"discount":5}
+Escalar: {"action":"escalate","reason":"motivo"}
+Buscar alternativa: {"action":"search","q":"término alternativo"}
+
+REGLAS CLAVE:
+- SOLO vendes ropa y accesorios de Taller AR. Nada más.
+- Si no tienes un producto → busca alternativa en catálogo y ofrécela.
+- Si cliente duda → ofrece 5% descuento para cerrar ("te hago un 5% adicional si lo tomamos ahora").
+- Nunca inventes stock ni precios.
+- Si no puedes resolver → escala a humana.
+- Pedidos van como canal "Agente IA Grow" en Shopify.`;
+
+async function processMessage({ userId, message, channel, userData = {}, imageUrl = null }) {
   const historyKey = `conv_${channel}_${userId}`;
   const history = conversationCache.get(historyKey) || [];
-  const session = sessionCache.get(`session_${userId}`) || { cart: [], preferences: {} };
+  const session = sessionCache.get(`session_${userId}`) || { cart: [], discount: false };
 
-  history.push({ role: 'user', content: message });
+  // Construir mensaje del usuario (con imagen si aplica)
+  let userContent = message;
+  if (imageUrl) {
+    userContent = [
+      { type: 'text', text: message || 'El cliente envió esta imagen, identifica el producto y busca en catálogo' },
+      { type: 'image_url', image_url: { url: imageUrl } }
+    ];
+  }
+
+  history.push({ role: 'user', content: userContent });
 
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        ...history.slice(-12),
+        ...history.slice(-14),
       ],
-      temperature: 0.7,
-      max_tokens: 600,
+      temperature: 0.65,
+      max_tokens: 500,
     });
 
     let assistantMessage = response.choices[0].message.content;
@@ -70,21 +95,19 @@ async function processMessage({ userId, message, channel, userData = {} }) {
     }
 
     let actionResult = null;
-    if (action) {
-      actionResult = await executeAction(action, session, userId);
-    }
+    if (action) actionResult = await executeAction(action, session, userId);
 
     if (actionResult) {
       const secondResponse = await openai.chat.completions.create({
         model: 'gpt-4o',
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          ...history.slice(-10),
-          { role: 'assistant', content: cleanMessage || 'Un momento...' },
-          { role: 'user', content: `[DATOS REALES DE SHOPIFY]: ${JSON.stringify(actionResult)}\n\nUsa estos datos para responder de forma natural y cálida. NO incluyas JSON en tu respuesta final.` },
+          ...history.slice(-12),
+          { role: 'assistant', content: cleanMessage || '...' },
+          { role: 'user', content: `[DATOS SHOPIFY EN TIEMPO REAL]: ${JSON.stringify(actionResult)}\n\nResponde naturalmente, corto, como asesora. Si hay productos incluye el link directo. Si creaste carrito incluye el link de pago. Sin JSON en tu respuesta.` },
         ],
-        temperature: 0.7,
-        max_tokens: 600,
+        temperature: 0.65,
+        max_tokens: 500,
       });
       assistantMessage = secondResponse.choices[0].message.content;
       assistantMessage = assistantMessage.replace(/\{"action":"[^}]+"[^}]*\}/g, '').trim();
@@ -100,70 +123,54 @@ async function processMessage({ userId, message, channel, userData = {} }) {
       actionData: actionResult,
       needsHuman: action && action.action === 'escalate',
       escalateReason: action ? action.reason : null,
-      escalateSummary: action ? action.summary : null,
     };
 
   } catch (e) {
-    console.error('Error en agente IA:', e.message);
-    return {
-      message: 'Tuve un pequeño problema. Puedo conectarte con una asesora ahora mismo.',
-      needsHuman: true,
-    };
+    console.error('Error agente:', e.message);
+    return { message: 'Tuve un problema. Te conecto con una asesora ahora.', needsHuman: true };
   }
 }
 
 async function executeAction(action, session, userId) {
   switch (action.action) {
-    case 'search_products': {
-      const products = await shopify.searchProducts(action.query);
+    case 'search':
+    case 'all_products': {
+      const q = action.q || '';
+      const products = q ? await shopify.searchProducts(q) : await shopify.getProducts({ limit: 8 });
       return {
         type: 'products',
-        found: products.length,
-        products: products.slice(0, 4).map(shopify.formatProductForAgent),
+        products: products.slice(0, 5).map(shopify.formatProductForAgent),
       };
     }
-    case 'get_collection': {
-      const collections = await shopify.getCollections();
-      const match = collections.find(c =>
-        c.title.toLowerCase().includes(action.name.toLowerCase())
-      );
-      if (match) {
-        const products = await shopify.getProductsByCollection(match.id);
-        return {
-          type: 'collection',
-          collectionName: match.title,
-          products: products.slice(0, 5).map(shopify.formatProductForAgent),
-        };
-      }
-      const products = await shopify.searchProducts(action.name);
-      return { type: 'products', products: products.slice(0, 5).map(shopify.formatProductForAgent) };
-    }
-    case 'check_stock': {
+    case 'stock': {
       const products = await shopify.getProducts({ limit: 250 });
       const product = products.find(p => p.id === action.productId);
-      if (!product) return { type: 'stock', error: 'Producto no encontrado' };
+      if (!product) return { type: 'stock_error', msg: 'Producto no encontrado' };
       const availability = await shopify.checkVariantAvailability(product, action.size);
       return { type: 'stock', productTitle: product.title, variants: availability };
     }
-    case 'create_cart': {
+    case 'cart': {
+      const discountPct = action.discount || 0;
       const draft = await shopify.createDraftOrder({
         items: action.items,
-        customerNote: action.note || 'Pedido desde chat - Taller AR',
+        customerNote: 'Pedido vía Agente IA Grow - Instagram/WhatsApp',
+        discountPercent: discountPct,
+        source: 'Agente IA Grow',
       });
       if (draft) {
-        session.lastDraftOrder = draft;
+        session.lastDraft = draft;
+        session.discount = discountPct > 0;
         return {
           type: 'cart_created',
           invoiceUrl: draft.invoiceUrl,
           total: '$' + parseInt(draft.totalPrice).toLocaleString('es-CL'),
-          items: draft.lineItems ? draft.lineItems.length : action.items.length,
+          discount: discountPct,
         };
       }
-      return { type: 'cart_error', message: 'No se pudo crear el carrito' };
+      return { type: 'cart_error' };
     }
-    case 'escalate': {
-      return { type: 'escalate', reason: action.reason, summary: action.summary };
-    }
+    case 'escalate':
+      return { type: 'escalate', reason: action.reason };
     default:
       return null;
   }
