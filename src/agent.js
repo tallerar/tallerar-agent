@@ -1,8 +1,8 @@
-const OpenAI = require('openai');
+const Groq = require('groq-sdk');
 const shopify = require('./shopify');
 const NodeCache = require('node-cache');
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const conversationCache = new NodeCache({ stdTTL: 1800 });
 const sessionCache = new NodeCache({ stdTTL: 3600 });
 
@@ -36,47 +36,32 @@ Accesorios $6-40k / Blusas $40-50k / Pantalones $44-75k / Vestidos $50-59k / Bla
 
 SHOWROOM: Javiera Carrera 533, Rancagua. Despacho a todo Chile.
 
-SOBRE IMÁGENES Y STORIES:
-Si cliente envía imagen o responde una story, identifica el producto y busca en catálogo. Di exactamente qué prenda es y si hay stock.
-
-ACCIONES DISPONIBLES (incluye JSON al FINAL si necesitas):
+ACCIONES DISPONIBLES (incluye JSON al FINAL del mensaje si necesitas):
 Buscar: {"action":"search","q":"término"}
-Ver todos: {"action":"all_products"}
 Stock específico: {"action":"stock","productId":123,"size":"M"}
-Crear link pago: {"action":"cart","items":[{"variantId":123,"qty":1}],"discount":5}
+Crear carrito: {"action":"cart","items":[{"variantId":123,"qty":1}],"discount":0}
 Escalar: {"action":"escalate","reason":"motivo"}
-Buscar alternativa: {"action":"search","q":"término alternativo"}
 
 REGLAS CLAVE:
 - SOLO vendes ropa y accesorios de Taller AR. Nada más.
-- Si no tienes un producto → busca alternativa en catálogo y ofrécela.
-- Si cliente duda → ofrece 5% descuento para cerrar ("te hago un 5% adicional si lo tomamos ahora").
+- Si no tienes un producto → busca alternativa y ofrécela.
+- Si cliente duda → ofrece 5% descuento para cerrar.
 - Nunca inventes stock ni precios.
-- Si no puedes resolver → escala a humana.
-- Pedidos van como canal "Agente IA Grow" en Shopify.`;
+- Si no puedes resolver → escala a humana.`;
 
 async function processMessage({ userId, message, channel, userData = {}, imageUrl = null }) {
   const historyKey = `conv_${channel}_${userId}`;
   const history = conversationCache.get(historyKey) || [];
-  const session = sessionCache.get(`session_${userId}`) || { cart: [], discount: false };
+  const session = sessionCache.get(`session_${userId}`) || {};
 
-  // Construir mensaje del usuario (con imagen si aplica)
-  let userContent = message;
-  if (imageUrl) {
-    userContent = [
-      { type: 'text', text: message || 'El cliente envió esta imagen, identifica el producto y busca en catálogo' },
-      { type: 'image_url', image_url: { url: imageUrl } }
-    ];
-  }
-
-  history.push({ role: 'user', content: userContent });
+  history.push({ role: 'user', content: message || 'El cliente envió una imagen' });
 
   try {
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
+    const response = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        ...history.slice(-14),
+        ...history.slice(-12),
       ],
       temperature: 0.65,
       max_tokens: 500,
@@ -98,13 +83,15 @@ async function processMessage({ userId, message, channel, userData = {}, imageUr
     if (action) actionResult = await executeAction(action, session, userId);
 
     if (actionResult) {
-      const secondResponse = await openai.chat.completions.create({
-        model: 'gpt-4o',
+      const context = `[DATOS SHOPIFY]: ${JSON.stringify(actionResult)}\n\nResponde naturalmente, corto, como asesora. Incluye links de productos si los hay. Sin JSON en tu respuesta.`;
+      
+      const secondResponse = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
         messages: [
           { role: 'system', content: SYSTEM_PROMPT },
-          ...history.slice(-12),
+          ...history.slice(-10),
           { role: 'assistant', content: cleanMessage || '...' },
-          { role: 'user', content: `[DATOS SHOPIFY EN TIEMPO REAL]: ${JSON.stringify(actionResult)}\n\nResponde naturalmente, corto, como asesora. Si hay productos incluye el link directo. Si creaste carrito incluye el link de pago. Sin JSON en tu respuesta.` },
+          { role: 'user', content: context },
         ],
         temperature: 0.65,
         max_tokens: 500,
@@ -127,45 +114,32 @@ async function processMessage({ userId, message, channel, userData = {}, imageUr
 
   } catch (e) {
     console.error('Error agente:', e.message);
-    return { message: 'Tuve un problema. Te conecto con una asesora ahora.', needsHuman: true };
+    return { message: 'Un momento, ya te ayudo 🌸', needsHuman: false };
   }
 }
 
 async function executeAction(action, session, userId) {
   switch (action.action) {
-    case 'search':
-    case 'all_products': {
-      const q = action.q || '';
-      const products = q ? await shopify.searchProducts(q) : await shopify.getProducts({ limit: 8 });
-      return {
-        type: 'products',
-        products: products.slice(0, 5).map(shopify.formatProductForAgent),
-      };
+    case 'search': {
+      const products = await shopify.searchProducts(action.q || '');
+      return { type: 'products', products: products.slice(0, 4).map(shopify.formatProductForAgent) };
     }
     case 'stock': {
       const products = await shopify.getProducts({ limit: 250 });
       const product = products.find(p => p.id === action.productId);
-      if (!product) return { type: 'stock_error', msg: 'Producto no encontrado' };
+      if (!product) return { type: 'stock_error' };
       const availability = await shopify.checkVariantAvailability(product, action.size);
       return { type: 'stock', productTitle: product.title, variants: availability };
     }
     case 'cart': {
-      const discountPct = action.discount || 0;
       const draft = await shopify.createDraftOrder({
         items: action.items,
-        customerNote: 'Pedido vía Agente IA Grow - Instagram/WhatsApp',
-        discountPercent: discountPct,
-        source: 'Agente IA Grow',
+        customerNote: 'Pedido vía Agente IA Grow',
+        discountPercent: action.discount || 0,
       });
       if (draft) {
         session.lastDraft = draft;
-        session.discount = discountPct > 0;
-        return {
-          type: 'cart_created',
-          invoiceUrl: draft.invoiceUrl,
-          total: '$' + parseInt(draft.totalPrice).toLocaleString('es-CL'),
-          discount: discountPct,
-        };
+        return { type: 'cart_created', invoiceUrl: draft.invoiceUrl, total: '$' + parseInt(draft.totalPrice).toLocaleString('es-CL'), discount: action.discount };
       }
       return { type: 'cart_error' };
     }
